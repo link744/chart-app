@@ -1,0 +1,318 @@
+"""chartbuilder.py — SPSS-style simple chart building.
+
+Pick an X variable, a Y variable, and optionally a cluster variable and a
+filter. Get a clean bar or line chart. Handles nominal, ordinal, and
+continuous variables:
+
+  * nominal / ordinal X  -> one bar/point per category
+  * continuous X         -> grouped by value (<=12 distinct) or auto-binned
+  * continuous Y         -> aggregated (mean / sum / median)
+  * categorical Y        -> counted (n per category)
+
+Type is auto-detected from the column; override per call if needed:
+    chart.x("Year", "ordinal")
+
+Usage
+-----
+    from chartbuilder import Chart
+
+    Chart(df).x("Region").y("Sales").cluster("Quarter").plot(kind="bar")
+    Chart(df).x("Year").y("Sales").cluster("Region").plot(kind="line")
+    Chart(df).x("Region").y("Sales").cluster("Quarter").filter("Year", 2025) \
+        .plot(kind="bar").save("chart.png")
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+
+if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+# Tableau palette — clean, colour-blind-friendly, good print contrast.
+PALETTE = [
+    "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
+    "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD",
+]
+
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#cccccc",
+    "axes.linewidth": 0.8,
+    "axes.grid": True,
+    "axes.axisbelow": True,
+    "grid.color": "#ececec",
+    "grid.linewidth": 0.8,
+    "xtick.color": "#555555",
+    "ytick.color": "#555555",
+    "text.color": "#333333",
+    "font.size": 10,
+    "axes.titlesize": 13,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 11,
+    "axes.labelcolor": "#333333",
+    "legend.frameon": False,
+    "legend.fontsize": 9,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+_STAT_LABEL = {
+    "mean": "Mean {y}",
+    "median": "Median {y}",
+    "sum": "Total {y}",
+    "count": "Count",
+}
+
+
+def _infer_scale(series: pd.Series) -> str:
+    """Guess the measurement scale of a column."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "continuous"
+    if not pd.api.types.is_numeric_dtype(series):
+        return "nominal"
+    uniq = series.dropna().nunique()
+    return "ordinal" if uniq <= 8 else "continuous"
+
+
+def _stat(values: pd.Series, stat: str) -> float:
+    values = pd.Series(values).dropna()
+    if stat == "count":
+        return float(len(values))
+    if stat == "mean":
+        return float(values.mean()) if len(values) else np.nan
+    if stat == "median":
+        return float(values.median()) if len(values) else np.nan
+    if stat == "sum":
+        return float(values.sum()) if len(values) else np.nan
+    raise ValueError(f"Unknown stat {stat!r} (use mean/median/sum/count)")
+
+
+class Chart:
+    """SPSS-style chart builder: x, y, optional cluster, optional filter."""
+
+    def __init__(self, df: pd.DataFrame, title: str | None = None):
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df must be a pandas DataFrame")
+        self.df = df
+        self._title = title
+        self._x = self._y = self._cluster = None
+        self._xscale = self._yscale = self._cscale = None
+        self._filters: list[tuple[str, object]] = []
+        self._stat: str | None = None
+        self._fig: plt.Figure | None = None
+        self._ax = None
+        self._ylabels: list[str] | None = None
+        self._stat_used = "mean"
+
+    # ------------------------------------------------------------------ #
+    # spec                                                               #
+    # ------------------------------------------------------------------ #
+    def x(self, col: str, scale: str | None = None) -> "Chart":
+        self._x = col
+        self._xscale = scale or _infer_scale(self.df[col])
+        return self
+
+    def y(self, col: str, scale: str | None = None) -> "Chart":
+        self._y = col
+        self._yscale = scale or _infer_scale(self.df[col])
+        return self
+
+    def cluster(self, col: str, scale: str | None = None) -> "Chart":
+        self._cluster = col
+        self._cscale = scale or _infer_scale(self.df[col])
+        return self
+
+    def filter(self, col: str, values) -> "Chart":
+        """Restrict rows: scalar -> ==, list/tuple/set -> isin."""
+        self._filters.append((col, values))
+        return self
+
+    # ------------------------------------------------------------------ #
+    # internals                                                          #
+    # ------------------------------------------------------------------ #
+    def _filtered(self) -> pd.DataFrame:
+        df = self.df
+        for col, values in self._filters:
+            if isinstance(values, (list, tuple, set)):
+                df = df[df[col].isin(list(values))]
+            else:
+                df = df[df[col] == values]
+        return df
+
+    def _effective_stat(self) -> str:
+        """Categorical Y is counted; continuous Y uses the requested stat."""
+        if self._yscale in ("nominal", "ordinal"):
+            return "count"
+        return self._stat if self._stat in ("mean", "median", "sum", "count") else "mean"
+
+    def _aggregate(self, sub: pd.DataFrame) -> tuple[list[str], list[float], list[float]]:
+        """Return (labels, y values, x positions) for one series."""
+        xcol, ycol, stat = self._x, self._y, self._stat_used
+        xs, ys = sub[xcol], sub[ycol]
+
+        if self._xscale == "continuous":
+            if xs.nunique(dropna=True) <= 12:
+                order = np.sort(xs.dropna().unique())
+                labels = [f"{v:g}" if pd.api.types.is_numeric_dtype(xs) else str(v)
+                          for v in order]
+                vals = [_stat(sub.loc[sub[xcol] == v, ycol], stat) for v in order]
+                return labels, vals, [float(v) for v in order]
+            # too many distinct values -> equal-width bins
+            binned = pd.cut(xs, 8)
+            sub2 = sub.copy()
+            sub2["__bin__"] = binned
+            cats = binned.cat.categories
+            labels = [f"{iv.left:g}–{iv.right:g}" for iv in cats]
+            vals, pos = [], []
+            for iv in cats:
+                g = sub2[sub2["__bin__"] == iv][ycol]
+                vals.append(_stat(g, stat))
+                pos.append(float(iv.mid))
+            return labels, vals, pos
+
+        order = list(xs.dropna().unique())  # appearance order for categories
+        labels = [str(v) for v in order]
+        vals = [_stat(sub.loc[sub[xcol] == v, ycol], stat) for v in order]
+        return labels, vals, list(range(len(order)))
+
+    def _series(self) -> list[tuple[str, list[str], list[float], list[float]]]:
+        """[(name, labels, values, positions), ...]"""
+        sub = self._filtered()
+        if sub.empty:
+            raise ValueError("No rows left after filters — check filter values.")
+        out: list[tuple[str, list[str], list[float], list[float]]] = []
+        if self._cluster is None:
+            labels, vals, pos = self._aggregate(sub)
+            out.append((self._x, labels, vals, pos))
+        else:
+            ccol = self._cluster
+            order = list(sub[ccol].dropna().unique())
+            for c in order:
+                cs = sub[sub[ccol] == c]
+                labels, vals, pos = self._aggregate(cs)
+                out.append((str(c), labels, vals, pos))
+        return out
+
+    # ------------------------------------------------------------------ #
+    # render                                                             #
+    # ------------------------------------------------------------------ #
+    def plot(self, kind: str = "bar", title: str | None = None,
+             stat: str | None = None, figsize: tuple[float, float] = (9, 5.5),
+             dpi: int = 150) -> "Chart":
+        if kind not in ("bar", "line"):
+            raise ValueError("kind must be 'bar' or 'line'")
+        if self._x is None or self._y is None:
+            raise ValueError("Call .x(...) and .y(...) first")
+        if self._x == self._y:
+            raise ValueError("x and y must be different columns")
+        if self._cluster is not None and self._cluster in (self._x, self._y):
+            raise ValueError("cluster must be a different column from x and y")
+        if kind == "bar" and self._xscale == "continuous" and self._cluster is not None:
+            raise ValueError("Clustered bar charts need a nominal/ordinal x — "
+                             "use a line chart or drop cluster")
+        if stat:
+            self._stat = stat
+        self._stat_used = self._effective_stat()
+
+        series = self._series()
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        n = len(series[0][1])
+        labels = series[0][1]
+
+        if kind == "bar":
+            self._draw_bar(ax, series, n, labels)
+        else:
+            self._draw_line(ax, series, n, labels)
+
+        # axis cosmetics
+        ax.grid(axis="y")
+        ax.set_xlabel(self._x)
+        ylab = _STAT_LABEL[self._stat_used].format(y=self._y)
+        ax.set_ylabel(ylab)
+        if self._xscale == "continuous":
+            pos0 = series[0][3]
+            long = len(labels) > 8 or max(len(str(l)) for l in labels) > 6
+            if long and self._xscale == "continuous" and len(set(pos0)) > 1:
+                # fewer tick labels, rotated
+                step = max(1, len(pos0) // 8)
+                ax.set_xticks(pos0[::step], labels[::step], rotation=35, fontsize=8)
+            else:
+                ax.set_xticks(pos0, labels)
+                ax.tick_params(axis="x", labelsize=9)
+        else:
+            ax.set_xticks(range(n), labels)
+            if len(labels) > 8 or max(len(str(l)) for l in labels) > 6:
+                ax.tick_params(axis="x", rotation=35, labelsize=8)
+            else:
+                ax.tick_params(axis="x", labelsize=9)
+
+        if self._xscale == "continuous":
+            lo = min(min(s[3]) for s in series)
+            hi = max(max(s[3]) for s in series)
+            ax.set_xlim(lo - (hi - lo) * 0.08, hi + (hi - lo) * 0.08)
+        else:
+            ax.set_xlim(-0.6, n - 0.4)
+        ax.margins(y=0.06)
+
+        if len(series) > 1:
+            ax.legend(title="Cluster" if self._cluster is None else None,
+                      labels=[s[0] for s in series], loc="upper left")
+        t = title or self._title or self._default_title()
+        ax.set_title(t)
+        fig.tight_layout()
+        self._fig, self._ax = fig, ax
+        self._ylabels = labels
+        return self
+
+    def _draw_bar(self, ax, series, n, labels):
+        width = 0.75 / len(series)
+        for i, (name, _l, vals, pos) in enumerate(series):
+            xs = [p - (len(series) - 1) * width / 2 + i * width if self._xscale != "continuous"
+                  else p for p in pos]
+            ax.bar(xs, vals, width=width if self._xscale != "continuous" else width,
+                   color=PALETTE[i % len(PALETTE)],
+                   edgecolor="white", linewidth=0.8,
+                   label=name, zorder=3)
+
+    def _draw_line(self, ax, series, n, labels):
+        for i, (name, _l, vals, pos) in enumerate(series):
+            ax.plot(pos, vals, marker="o", markersize=4, linewidth=1.8,
+                    color=PALETTE[i % len(PALETTE)], label=name, zorder=3)
+
+    def _default_title(self) -> str:
+        t = f"{self._y} by {self._x}"
+        if self._cluster is not None:
+            t += f" — {self._cluster}"
+        return t
+
+    # ------------------------------------------------------------------ #
+    # output                                                             #
+    # ------------------------------------------------------------------ #
+    def save(self, path: str) -> "Chart":
+        if self._fig is None:
+            raise ValueError("Call .plot() before .save()")
+        self._fig.savefig(path, dpi=self._fig.dpi, facecolor="white")
+        return self
+
+    def show(self):
+        if self._fig is None:
+            raise ValueError("Call .plot() before .show()")
+        plt.show()
+        return self
+
+    def __repr__(self):
+        parts = [f"Chart(x={self._x!r}, y={self._y!r}"]
+        if self._cluster is not None:
+            parts.append(f", cluster={self._cluster!r}")
+        if self._filters:
+            parts.append(f", filter={self._filters}")
+        parts.append(")")
+        return "".join(parts)
