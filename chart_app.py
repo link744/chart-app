@@ -1,16 +1,18 @@
 """chart_app.py — web app: upload a CSV, pick X / Y / cluster / filter,
 get a clean bar or line chart. Built on chartbuilder.py.
 
-Run:  .venv-grapher/bin/python chart_app.py  (port 8011, bind 0.0.0.0)
+Two-step flow:
+  1) "Upload CSV" (or "Load sample data") loads a dataset — no chart yet.
+  2) Pick X / Y / cluster / filter, then "Build chart".
+
+Run:  python chart_app.py  (port $PORT or 8011, bind 0.0.0.0)
 """
 from __future__ import annotations
-
 import io
 import uuid
 
 import pandas as pd
-from flask import (Flask, abort, flash, jsonify, redirect, render_template_string,
-                   request, url_for)
+from flask import (Flask, abort, flash, render_template_string, request, url_for)
 
 from chartbuilder import Chart
 
@@ -19,7 +21,8 @@ app.secret_key = "chart-builder-local-" + uuid.uuid4().hex
 
 # uploaded datasets: token -> DataFrame (in memory; fine for a single-user tool)
 _DATASETS: dict[str, pd.DataFrame] = {}
-
+_MAX_DATASETS = 10
+_FIELDS = ("x", "y", "cluster", "fcol", "fval", "kind", "stat", "title")
 
 SAMPLE_CSV = """Year,Region,Product,Sales
 2019,North,Widget,120
@@ -42,6 +45,20 @@ SAMPLE_CSV = """Year,Region,Product,Sales
 2022,West,Gadget,85
 """
 
+
+def _remember(token: str, df: pd.DataFrame) -> None:
+    _DATASETS[token] = df
+    while len(_DATASETS) > _MAX_DATASETS:
+        oldest = next(iter(_DATASETS))
+        del _DATASETS[oldest]
+
+
+def _sample() -> pd.DataFrame:
+    if "sample" not in _DATASETS:
+        _remember("sample", pd.read_csv(io.StringIO(SAMPLE_CSV)))
+    return _DATASETS["sample"]
+
+
 PAGE = """<!doctype html>
 <html>
 <head>
@@ -58,6 +75,8 @@ PAGE = """<!doctype html>
   .sub { color: #777; font-size: 13px; margin-bottom: 20px; }
   .card { background: #fff; border: 1px solid var(--line); border-radius: 10px;
           padding: 18px; margin-bottom: 18px; }
+  .card-title { font-size: 13px; font-weight: 600; color: #555; text-transform: uppercase;
+                letter-spacing: .04em; margin: 0 0 12px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
           gap: 12px 14px; }
   label { display: block; font-size: 12px; font-weight: 600; color: #555;
@@ -79,7 +98,7 @@ PAGE = """<!doctype html>
             padding: 8px 18px; border-radius: 6px; font-size: 14px; font-weight: 600; }
   .chart-box { text-align: center; }
   .chart-box img { max-width: 100%; height: auto; border: 1px solid var(--line);
-                    border-radius: 6px; background: #fff; }
+                   border-radius: 6px; background: #fff; }
   .err { background: #fdecea; color: #b03030; border: 1px solid #f0c4c4;
           border-radius: 6px; padding: 8px 12px; font-size: 13px; margin-bottom: 14px; }
   .info { color: #777; font-size: 13px; }
@@ -91,29 +110,34 @@ PAGE = """<!doctype html>
 <body>
 <div class="wrap">
   <h1>Chart Builder</h1>
-  <div class="sub">Pick an X, a Y, and optionally a cluster and a filter. Bar or line, done.</div>
+  <div class="sub">1) Load a dataset. 2) Pick an X, a Y, and optionally a cluster and a filter. 3) Bar or line, done.</div>
 
   {% if errors %}
   <div class="err">{{ errors[0] }}</div>
   {% endif %}
 
   <form method="post" enctype="multipart/form-data" class="card">
+    <div class="card-title">1 · Load data</div>
     <input type="hidden" name="token" value="{{ token or '' }}">
+    <input type="hidden" name="mode" value="load">
     <div class="row">
       <div>
         <label for="file">CSV file</label>
         <input type="file" name="file" accept=".csv,text/csv">
-        <div class="hint">or keep using the loaded data</div>
-      </div>
-      <div>
-        <label for="sample">Sample data</label>
-        <select name="sample">
-          <option value="">— keep current —</option>
-          <option value="sample" {{ 'selected' if sample is undefined }}>Load sample dataset</option>
-        </select>
+        <div class="hint">first row must be a header</div>
       </div>
     </div>
-    <div class="grid" style="margin-top:14px">
+    <div class="btn-row">
+      <button type="submit">Upload CSV</button>
+      <button type="submit" name="sample" value="sample" class="ghost">Load sample data</button>
+    </div>
+  </form>
+
+  <form method="post" class="card">
+    <div class="card-title">2 · Chart</div>
+    <input type="hidden" name="token" value="{{ token or '' }}">
+    <input type="hidden" name="mode" value="build">
+    <div class="grid">
       <div>
         <label for="x">X axis</label>
         <select name="x" required>
@@ -170,7 +194,6 @@ PAGE = """<!doctype html>
     </div>
     <div class="btn-row">
       <button type="submit">Build chart</button>
-      <a class="ghost" href="/sample">Load sample data</a>
     </div>
   </form>
 
@@ -194,11 +217,15 @@ def _cols(df: pd.DataFrame) -> list[str]:
 
 
 def _form() -> dict:
-    f = {k: request.form.get(k, "") for k in
-         ("x", "y", "cluster", "fcol", "fval", "kind", "stat", "title")}
+    f = {k: request.form.get(k, "") for k in _FIELDS}
     f["kind"] = f["kind"] or "bar"
     f["stat"] = f["stat"] or "auto"
     return f
+
+
+def _reset_form() -> dict:
+    return {"x": "", "y": "", "cluster": "", "fcol": "", "fval": "",
+            "kind": "bar", "stat": "auto", "title": ""}
 
 
 def _render(df, form, token, chart_url=None, errors=None):
@@ -217,46 +244,53 @@ def index():
     token = request.form.get("token") or request.args.get("token")
     df = _DATASETS.get(token) if token else None
     form = _form()
+    mode = request.form.get("mode", "")
 
-    if request.method == "POST":
-        chart_url = None
-        # 1) new CSV upload?
+    if request.method == "POST" and mode == "load":
+        # step 1: load a dataset only — no chart yet
         f = request.files.get("file")
         if f is not None and f.filename:
             try:
-                df = pd.read_csv(f)
+                newdf = pd.read_csv(f)
             except Exception as e:
+                newdf = None
                 flash(f"Could not read CSV: {e}")
-                df = None
-            if df is not None:
-                if df.shape[1] < 2:
+            if newdf is not None:
+                if newdf.shape[1] < 2:
                     flash("CSV needs at least two columns.")
+                    newdf = None
                 else:
                     token = uuid.uuid4().hex
-                    _DATASETS[token] = df
-        if request.form.get("sample") == "sample" or (
-                df is None and request.method == "POST" and not f):
-            df = pd.read_csv(io.StringIO(SAMPLE_CSV))
+                    _remember(token, newdf)
+                    df = newdf
+                    form = _reset_form()
+        elif request.form.get("sample") == "sample":
+            df = _sample()
             token = "sample"
-            _DATASETS["sample"] = df
-        if df is None and token is None:
-            flash("Upload a CSV to get started.")
-            df = pd.DataFrame({"A": [1], "B": [2]})
+            form = _reset_form()
+        if df is None:
+            df = _sample()
+            token = "sample"
+        return _render(df, form, token)
 
-        # 2) validate spec
+    if request.method == "POST":
+        # step 2: build a chart from the loaded dataset
+        if df is None:
+            df = _sample()
+            token = "sample"
         errors = None
-        if df is not None:
-            if form["x"] and form["y"] and form["x"] != form["y"]:
-                errors, chart_url = _build(df, form)
-            elif form["x"] and form["y"]:
-                errors = ["X and Y must be different columns."]
-            else:
-                errors = ["Pick both an X and a Y column."]
+        chart_url = None
+        if form["x"] and form["y"] and form["x"] != form["y"]:
+            errors, chart_url = _build(df, form)
+        elif form["x"] and form["y"]:
+            errors = ["X and Y must be different columns."]
+        else:
+            errors = ["Pick both an X and a Y column."]
         return _render(df, form, token, chart_url, errors)
 
     # GET
     if df is None:
-        df = pd.read_csv(io.StringIO(SAMPLE_CSV))
+        df = _sample()
         token = "sample"
     return _render(df, form, token)
 
