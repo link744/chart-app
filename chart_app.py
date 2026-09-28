@@ -115,9 +115,43 @@ def _validate(df: pd.DataFrame) -> str | None:
         return "CSV needs at least two columns."
     if df.shape[1] > _MAX_COLS:
         return f"CSV has {df.shape[1]} columns — the limit is {_MAX_COLS}."
-    if df.shape[0] > _MAX_ROWS:
-        return f"CSV has {df.shape[0]:,} rows — the limit is {_MAX_ROWS:,}."
     return None
+
+
+def _intake(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Make an oversized upload work instead of failing:
+
+    * > 1M rows  -> keep the first 1M, warn in the UI
+    * text columns that look like dates/datetimes -> real datetime columns
+
+    Returns (df, warnings).
+    """
+    notes: list[str] = []
+
+    if len(df) > _MAX_ROWS:
+        total = len(df)
+        df = df.head(_MAX_ROWS).copy()
+        notes.append(
+            f"Large file: showing the first {_MAX_ROWS:,} of {total:,} rows — "
+            f"rows after that were trimmed, not an error.")
+
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s) or \
+                pd.api.types.is_numeric_dtype(s) or \
+                pd.api.types.is_bool_dtype(s):
+            continue
+        sample = s.dropna().astype(str).head(500)
+        if sample.empty:
+            continue
+        parsed = pd.to_datetime(sample, errors="coerce", format="mixed",
+                               dayfirst=False)
+        ok = parsed.notna().sum()
+        if ok >= 0.8 * len(sample):
+            conv = pd.to_datetime(df[col], errors="coerce", format="mixed")
+            notes.append(f"Converted {col!r} to dates.")
+            df[col] = conv
+    return df, notes
 
 
 # --------------------------------------------------------------------- #
@@ -624,6 +658,8 @@ def index_post():
                 problem = _validate(newdf)
                 if problem:
                     newdf, err = None, problem
+                else:
+                    newdf, notes = _intake(newdf)
             if newdf is not None:
                 token = uuid.uuid4().hex
                 _remember(token, newdf, f.filename)

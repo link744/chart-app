@@ -6,6 +6,8 @@ continuous variables:
 
   * nominal / ordinal X  -> one bar/point per category
   * continuous X         -> grouped by value (<=12 distinct) or auto-binned
+  * date / datetime X    -> binned by calendar (day/week/month/quarter/year)
+                           on a real date axis, never coerced to numbers
   * continuous Y         -> aggregated (mean / sum / median)
   * categorical Y        -> counted (n per category)
 
@@ -33,6 +35,7 @@ import matplotlib
 
 if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
     matplotlib.use("Agg")
+from matplotlib import dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 # Tableau palette — clean, colour-blind-friendly, good print contrast.
@@ -75,11 +78,42 @@ _STAT_LABEL = {
 def _infer_scale(series: pd.Series) -> str:
     """Guess the measurement scale of a column."""
     if pd.api.types.is_datetime64_any_dtype(series):
-        return "continuous"
+        return "date"
     if not pd.api.types.is_numeric_dtype(series):
         return "nominal"
     uniq = series.dropna().nunique()
     return "ordinal" if uniq <= 8 else "continuous"
+
+
+def _date_freq(xs: pd.Series) -> str:
+    """Pick a calendar bin size for a datetime column from its span."""
+    if xs.empty:
+        raise ValueError("No valid dates in the X column")
+    span_d = (xs.max() - xs.min()).days
+    if span_d <= 12:
+        return "D"
+    if span_d <= 120:
+        return "W-SUN"
+    if span_d <= 730:
+        return "M"
+    if span_d <= 2190:
+        return "Q-DEC"
+    return "Y"
+
+
+# Bar widths in *days* (matplotlib date-axis units) per calendar bin size.
+_DATE_BAR_WIDTH = {"D": 0.8, "W-SUN": 5.6, "M": 24.4, "Q-DEC": 73.0, "Y": 292.0}
+
+
+def _date_label(freq: str, p) -> str:
+    """One tick label for a calendar period."""
+    if freq in ("D", "W-SUN"):
+        return p.strftime("%b %d")
+    if freq == "M":
+        return p.strftime("%b %Y")
+    if freq == "Q-DEC":
+        return str(p)
+    return str(p.year)
 
 
 def _stat(values: pd.Series, stat: str) -> float:
@@ -105,6 +139,7 @@ class Chart:
         self._title = title
         self._x = self._y = self._cluster = None
         self._xscale = self._yscale = self._cscale = None
+        self._datefreq: str | None = None
         self._filters: list[tuple[str, object]] = []
         self._stat: str | None = None
         self._fig: plt.Figure | None = None
@@ -117,7 +152,13 @@ class Chart:
     # ------------------------------------------------------------------ #
     def x(self, col: str, scale: str | None = None) -> "Chart":
         self._x = col
-        self._xscale = scale or _infer_scale(self.df[col])
+        self._is_date = pd.api.types.is_datetime64_any_dtype(self.df[col])
+        if scale:
+            self._xscale = scale
+        elif self._is_date:
+            self._xscale = "date"
+        else:
+            self._xscale = _infer_scale(self.df[col])
         return self
 
     def y(self, col: str, scale: str | None = None) -> "Chart":
@@ -158,6 +199,9 @@ class Chart:
         xcol, ycol, stat = self._x, self._y, self._stat_used
         xs, ys = sub[xcol], sub[ycol]
 
+        if self._xscale == "date":
+            return self._aggregate_date(sub, xcol, ycol, stat)
+
         if self._xscale == "continuous":
             if xs.nunique(dropna=True) <= 12:
                 order = np.sort(xs.dropna().unique())
@@ -182,6 +226,39 @@ class Chart:
         labels = [str(v) for v in order]
         vals = [_stat(sub.loc[sub[xcol] == v, ycol], stat) for v in order]
         return labels, vals, list(range(len(order)))
+
+    def _aggregate_date(self, sub, xcol, ycol, stat):
+        """Calendar-aware binning for a date/datetime X column.
+
+        Rows are grouped by calendar period (day/week/month/quarter/year);
+        positions are real dates (matplotlib date units), never raw numbers.
+        Empty periods stay in the axis so gaps are visible.
+        """
+        xs = sub[xcol]
+        ys = sub[ycol]
+        if not pd.api.types.is_datetime64_any_dtype(xs):
+            raise ValueError(f"Column {xcol!r} is not a date column — "
+                             "cannot use a date axis for it")
+        span = xs.dropna()
+        if span.empty:
+            raise ValueError(f"No valid dates in the {xcol!r} column")
+        freq = self._datefreq or _date_freq(span)
+        self._datefreq = freq
+
+        periods = span.dt.to_period(freq)
+        lo = pd.period_range(start=periods.min(), end=periods.max(), freq=freq)
+        sub2 = sub[~periods.isna()].copy()
+        sub2["__p__"] = sub2[xcol].dt.to_period(freq)
+
+        centers, labels, vals = [], [], []
+        for p in lo:
+            centers.append(mdates.date2num(pd.Timestamp(p.start_time))
+                           + (p.end_time - p.start_time).total_seconds()
+                           / 86400 / 2)
+            labels.append(_date_label(freq, p))
+            g = ys[sub2["__p__"] == p]
+            vals.append(_stat(g, stat))
+        return labels, vals, centers
 
     def _series(self) -> list[tuple[str, list[str], list[float], list[float]]]:
         """[(name, labels, values, positions), ...]"""
@@ -215,7 +292,7 @@ class Chart:
             raise ValueError("x and y must be different columns")
         if self._cluster is not None and self._cluster in (self._x, self._y):
             raise ValueError("cluster must be a different column from x and y")
-        if kind == "bar" and self._xscale == "continuous" and self._cluster is not None:
+        if kind == "bar" and self._xscale in ("continuous", "date") and self._cluster is not None:
             raise ValueError("Clustered bar charts need a nominal/ordinal x — "
                              "use a line chart or drop cluster")
         if stat:
@@ -237,7 +314,15 @@ class Chart:
         ax.set_xlabel(self._x)
         ylab = _STAT_LABEL[self._stat_used].format(y=self._y)
         ax.set_ylabel(ylab)
-        if self._xscale == "continuous":
+        if self._xscale == "date":
+            pos0 = series[0][3]
+            step = max(1, -(-n // 9))  # at most ~9 tick labels
+            ax.set_xticks(pos0[::step], labels[::step], rotation=35, fontsize=8)
+            width_days = _DATE_BAR_WIDTH[self._datefreq]
+            lo = min(min(s[3]) for s in series)
+            hi = max(max(s[3]) for s in series)
+            ax.set_xlim(lo - width_days / 2 - 0.1, hi + width_days / 2 + 0.1)
+        elif self._xscale == "continuous":
             pos0 = series[0][3]
             long = len(labels) > 8 or max(len(str(l)) for l in labels) > 6
             if long and self._xscale == "continuous" and len(set(pos0)) > 1:
@@ -258,7 +343,7 @@ class Chart:
             lo = min(min(s[3]) for s in series)
             hi = max(max(s[3]) for s in series)
             ax.set_xlim(lo - (hi - lo) * 0.08, hi + (hi - lo) * 0.08)
-        else:
+        elif self._xscale != "date":
             ax.set_xlim(-0.6, n - 0.4)
         ax.margins(y=0.06)
 
@@ -273,6 +358,14 @@ class Chart:
         return self
 
     def _draw_bar(self, ax, series, n, labels):
+        if self._xscale == "date":
+            width = _DATE_BAR_WIDTH[self._datefreq]
+            for i, (name, _l, vals, pos) in enumerate(series):
+                ax.bar(pos, vals, width=width,
+                       color=PALETTE[i % len(PALETTE)],
+                       edgecolor="white", linewidth=0.8,
+                       label=name, zorder=3)
+            return
         width = 0.75 / len(series)
         for i, (name, _l, vals, pos) in enumerate(series):
             xs = [p - (len(series) - 1) * width / 2 + i * width if self._xscale != "continuous"
