@@ -265,7 +265,7 @@ def _build(df: pd.DataFrame, form: dict) -> tuple[list | None, str | None]:
     if form["x"] == form["y"]:
         return ["X and Y must be different columns."], None
     try:
-        c = Chart(df).x(form["x"]).y(form["y"])
+        c = Chart(df).x(form["x"]).y(form["y"], scale=None)
         if form["cluster"]:
             c = c.cluster(form["cluster"])
         if form["fcol"]:

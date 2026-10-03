@@ -81,15 +81,38 @@ def _infer_scale(series: pd.Series) -> str:
         return "date"
     if not pd.api.types.is_numeric_dtype(series):
         return "nominal"
-    uniq = series.dropna().nunique()
-    return "ordinal" if uniq <= 8 else "continuous"
+    s = series.dropna()
+    u = s.nunique()
+    # Repeated numeric values are categories (counted); all-distinct
+    # values are data points (plotted as-is, never collapsed to counts).
+    if u < len(s) and u <= 8:
+        return "ordinal"
+    return "continuous"
 
 
 def _date_freq(xs: pd.Series) -> str:
-    """Pick a calendar bin size for a datetime column from its span."""
+    """Pick a calendar bin size for a datetime column from its span.
+
+    Sparse data (<=12 distinct timestamps) -> one point per exact
+    timestamp at its real position; denser data gets calendar bins sized
+    by span: <=30 min -> 1 min; <=2 d -> 1 h; <=5 d -> 4 h; <=12 d ->
+    1 d; <=120 d -> 1 week; <=2 y -> 1 month; <=6 y -> 1 quarter.
+    """
     if xs.empty:
         raise ValueError("No valid dates in the X column")
-    span_d = (xs.max() - xs.min()).days
+    # Sparse data -> one point per exact timestamp at its real position
+    # (no calendar collapsing); denser data -> a calendar bin sized by span.
+    if xs.nunique() <= 12:
+        return "ts"
+    span = xs.max() - xs.min()
+    span_s = span.total_seconds()
+    span_d = span_s / 86400
+    if span_s <= 1800:
+        return "min"
+    if span_d <= 2:
+        return "h"
+    if span_d <= 5:
+        return "4h"
     if span_d <= 12:
         return "D"
     if span_d <= 120:
@@ -102,11 +125,24 @@ def _date_freq(xs: pd.Series) -> str:
 
 
 # Bar widths in *days* (matplotlib date-axis units) per calendar bin size.
-_DATE_BAR_WIDTH = {"D": 0.8, "W-SUN": 5.6, "M": 24.4, "Q-DEC": 73.0, "Y": 292.0}
+_DATE_BAR_WIDTH = {
+    "min": 1 / 1440,  # one minute, as a fraction of a day
+    "h": 0.9 / 24,
+    "4h": 3.5 / 24,
+    "D": 0.8,
+    "W-SUN": 5.6,
+    "M": 24.4,
+    "Q-DEC": 73.0,
+    "Y": 292.0,
+}
 
 
 def _date_label(freq: str, p) -> str:
     """One tick label for a calendar period."""
+    if freq in ("min", "h"):
+        return p.strftime("%H:%M")
+    if freq == "4h":
+        return p.strftime("%b %d %H:%M")
     if freq in ("D", "W-SUN"):
         return p.strftime("%b %d")
     if freq == "M":
@@ -118,6 +154,8 @@ def _date_label(freq: str, p) -> str:
 
 def _stat(values: pd.Series, stat: str) -> float:
     values = pd.Series(values).dropna()
+    if len(values) == 0:
+        return float("nan")  # no data in this bin -> visible gap on the axis
     if stat == "count":
         return float(len(values))
     if stat == "mean":
@@ -140,6 +178,7 @@ class Chart:
         self._x = self._y = self._cluster = None
         self._xscale = self._yscale = self._cscale = None
         self._datefreq: str | None = None
+        self._ts_width: float = 1.0 / 24  # bar width (days) for "ts" bins
         self._filters: list[tuple[str, object]] = []
         self._stat: str | None = None
         self._fig: plt.Figure | None = None
@@ -245,6 +284,38 @@ class Chart:
         freq = self._datefreq or _date_freq(span)
         self._datefreq = freq
 
+        if freq == "ts":
+            # One point per exact timestamp (sparse intraday data) — real
+            # time-of-day positions, no calendar collapsing.
+            g = sub[~xs.isna()].sort_values(xcol)
+            xs_g = g[xcol].reset_index(drop=True)
+            ys_g = g[ycol].reset_index(drop=True)
+
+            def _num(t):
+                ts = pd.Timestamp(t)
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert("UTC").tz_localize(None)
+                return mdates.date2num(ts.to_pydatetime())
+
+            centers, labels, vals = [], [], []
+            for t in xs_g.unique():
+                start = pd.Timestamp(t)
+                if getattr(start, "tzinfo", None) is not None:
+                    start = start.tz_convert("UTC").tz_localize(None)
+                centers.append(_num(t))
+                labels.append(start.strftime("%b %d %H:%M"))
+                tvals = ys_g[xs_g == t]
+                vals.append(_stat(tvals, stat))
+            # Bar width: 75% of the smallest gap between distinct timestamps
+            # (days), floored so bars never vanish on a wide axis.
+            uniq = xs_g.unique()
+            if len(uniq) > 1:
+                min_gap = float(np.diff([_num(t) for t in uniq]).min())
+            else:
+                min_gap = 1.0 / 24  # default: one hour
+            self._ts_width = max(min_gap * 0.75, 1e-4)
+            return labels, vals, centers
+
         periods = span.dt.to_period(freq)
         lo = pd.period_range(start=periods.min(), end=periods.max(), freq=freq)
         sub2 = sub[~periods.isna()].copy()
@@ -252,7 +323,11 @@ class Chart:
 
         centers, labels, vals = [], [], []
         for p in lo:
-            centers.append(mdates.date2num(pd.Timestamp(p.start_time))
+            # tz-naive UTC so date2num gets a real datetime, not tz-aware
+            start = pd.Timestamp(p.start_time)
+            if getattr(start, "tzinfo", None) is not None:
+                start = start.tz_convert("UTC").tz_localize(None)
+            centers.append(mdates.date2num(start.to_pydatetime())
                            + (p.end_time - p.start_time).total_seconds()
                            / 86400 / 2)
             labels.append(_date_label(freq, p))
@@ -318,7 +393,8 @@ class Chart:
             pos0 = series[0][3]
             step = max(1, -(-n // 9))  # at most ~9 tick labels
             ax.set_xticks(pos0[::step], labels[::step], rotation=35, fontsize=8)
-            width_days = _DATE_BAR_WIDTH[self._datefreq]
+            width_days = (self._ts_width if self._datefreq == "ts"
+                         else _DATE_BAR_WIDTH[self._datefreq])
             lo = min(min(s[3]) for s in series)
             hi = max(max(s[3]) for s in series)
             ax.set_xlim(lo - width_days / 2 - 0.1, hi + width_days / 2 + 0.1)
@@ -359,7 +435,8 @@ class Chart:
 
     def _draw_bar(self, ax, series, n, labels):
         if self._xscale == "date":
-            width = _DATE_BAR_WIDTH[self._datefreq]
+            width = (self._ts_width if self._datefreq == "ts"
+                     else _DATE_BAR_WIDTH[self._datefreq])
             for i, (name, _l, vals, pos) in enumerate(series):
                 ax.bar(pos, vals, width=width,
                        color=PALETTE[i % len(PALETTE)],
