@@ -26,6 +26,7 @@ Usage
 
 from __future__ import annotations
 
+import math
 import os
 
 import numpy as np
@@ -90,45 +91,91 @@ def _infer_scale(series: pd.Series) -> str:
     return "continuous"
 
 
+def _period_bins(span: pd.Timedelta, freq: str) -> int:
+    """Approximate number of calendar periods a span covers.
+
+    Fixed-offset rungs (min/h/D/...) use exact arithmetic; calendar rungs
+    (M/Q/Y) use a period range (safe: those spans are short by ladder
+    construction).
+    """
+    if freq == "min":
+        return max(1, int(math.ceil(span.total_seconds() / 60)))
+    if freq == "5min":
+        return max(1, int(math.ceil(span.total_seconds() / 300)))
+    if freq == "15min":
+        return max(1, int(math.ceil(span.total_seconds() / 900)))
+    if freq == "30min":
+        return max(1, int(math.ceil(span.total_seconds() / 1800)))
+    if freq == "h":
+        return max(1, int(math.ceil(span.total_seconds() / 3600)))
+    if freq == "2h":
+        return max(1, int(math.ceil(span.total_seconds() / 7200)))
+    if freq == "8h":
+        return max(1, int(math.ceil(span.total_seconds() / 28800)))
+    if freq == "12h":
+        return max(1, int(math.ceil(span.total_seconds() / 43200)))
+    if freq == "D":
+        return max(1, int(math.ceil(span.total_seconds() / 86400)))
+    lo = pd.Timestamp("2026-01-01")
+    hi = lo + span
+    return max(1, len(pd.period_range(
+        lo.floor("D").to_period(freq), hi.to_period(freq), freq=freq)))
+
+
+# Finest -> coarsest ladder of X-axis bin sizes. Freqs with a "-" (e.g.
+# W-SUN, Q-DEC) are calendar periods; the rest are fixed offsets valid in
+# dt.floor(). The date picker walks this and takes the first rung that
+# yields at least 3 bins; the span picker then keeps the finest rung whose
+# bin count stays under the cap — so data density, not just span, decides.
+_DATE_LADDER: list[str] = [
+    "min", "5min", "15min", "30min", "h", "2h", "4h", "8h", "12h",
+    "D", "W-SUN", "M", "Q-DEC", "Y",
+]
+_DATE_CAP = 40  # max bins before we roll up to a coarser rung
+
+
 def _date_freq(xs: pd.Series) -> str:
-    """Pick a calendar bin size for a datetime column from its span.
+    """Pick a bin size for a datetime column from span AND density.
 
     Sparse data (<=12 distinct timestamps) -> one point per exact
-    timestamp at its real position; denser data gets calendar bins sized
-    by span: <=30 min -> 1 min; <=2 d -> 1 h; <=5 d -> 4 h; <=12 d ->
-    1 d; <=120 d -> 1 week; <=2 y -> 1 month; <=6 y -> 1 quarter.
+    timestamp at its real position. Denser data -> the finest calendar
+    rung whose bin count stays within ``_DATE_CAP`` *and* is not larger
+    than the number of data points, so bins are matched to the data:
+
+    * hundreds of 5-min rows over a week -> ~24 half-day bars (each with
+      many points), never two weekly ones (the old span-only collapse).
+    * 36 monthly rows -> 36 monthly bars, not 12 quarterly ones.
+    * 13 daily rows -> 13 daily bars, not 36 mostly-empty 8-hour ones.
+
+    A bin count above the point count would mean more empty bins than
+    data, which reads as a collapsed/empty chart.
     """
     if xs.empty:
         raise ValueError("No valid dates in the X column")
-    # Sparse data -> one point per exact timestamp at its real position
-    # (no calendar collapsing); denser data -> a calendar bin sized by span.
     if xs.nunique() <= 12:
         return "ts"
-    span = xs.max() - xs.min()
-    span_s = span.total_seconds()
-    span_d = span_s / 86400
-    if span_s <= 1800:
-        return "min"
-    if span_d <= 2:
-        return "h"
-    if span_d <= 5:
-        return "4h"
-    if span_d <= 12:
-        return "D"
-    if span_d <= 120:
-        return "W-SUN"
-    if span_d <= 730:
-        return "M"
-    if span_d <= 2190:
-        return "Q-DEC"
-    return "Y"
+    n = int(xs.nunique())
+    span = xs.max() - xs.min()  # scalar Timedelta
+    cap = min(_DATE_CAP, n)  # never more bins than data points
+    # _period_bins decreases monotonically up the ladder (coarser = fewer
+    # bins), so the first rung that fits is the finest acceptable one.
+    for f in _DATE_LADDER:
+        if _period_bins(span, f) <= cap:
+            return f
+    return _DATE_LADDER[-1]  # span so long that even yearly exceeds the cap
 
 
 # Bar widths in *days* (matplotlib date-axis units) per calendar bin size.
 _DATE_BAR_WIDTH = {
     "min": 1 / 1440,  # one minute, as a fraction of a day
+    "5min": 5 / 1440,
+    "15min": 15 / 1440,
+    "30min": 30 / 1440,
     "h": 0.9 / 24,
+    "2h": 1.8 / 24,
     "4h": 3.5 / 24,
+    "8h": 7.2 / 24,
+    "12h": 10.8 / 24,
     "D": 0.8,
     "W-SUN": 5.6,
     "M": 24.4,
@@ -139,9 +186,9 @@ _DATE_BAR_WIDTH = {
 
 def _date_label(freq: str, p) -> str:
     """One tick label for a calendar period."""
-    if freq in ("min", "h"):
+    if freq in ("min", "5min", "15min", "30min", "h", "2h"):
         return p.strftime("%H:%M")
-    if freq == "4h":
+    if freq in ("4h", "8h", "12h"):
         return p.strftime("%b %d %H:%M")
     if freq in ("D", "W-SUN"):
         return p.strftime("%b %d")
